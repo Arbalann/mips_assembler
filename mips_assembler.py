@@ -1,8 +1,11 @@
 import re
 
 
-class MipsParsingError(Exception):
+class MipsCompileError(Exception):
+    pass
 
+
+class MipsParsingError(Exception):
     current_parsed_line = None
 
     def __init__(self, message):
@@ -24,18 +27,14 @@ class _MipsAssembly(object):
         else:
             arguments = ""
 
-        # -----------------------------
         # ---------- J Types ----------
-        # -----------------------------
 
         if self._instruction == "j":
             self._parse_arguments(arguments, instruction_type="J", argument_format_string="j", opcode=0x2)
         elif self._instruction == "jal":
             self._parse_arguments(arguments, instruction_type="J", argument_format_string="j", opcode=0x3)
 
-        # -----------------------------
         # ---------- I Types ----------
-        # -----------------------------
 
         elif self._instruction == "beq":
             self._parse_arguments(arguments, instruction_type="I", argument_format_string="sti", opcode=0x4)
@@ -119,9 +118,7 @@ class _MipsAssembly(object):
             self._parse_arguments(arguments, instruction_type="I", argument_format_string="si",
                                   opcode=0x1, rt="$17")
 
-        # -----------------------------
         # ---------- R Types ----------
-        # -----------------------------
 
         elif self._instruction == "sll":
             self._parse_arguments(arguments, instruction_type="R", argument_format_string="(dt)a,dta", funct=0x0)
@@ -208,7 +205,7 @@ class _MipsAssembly(object):
             raise MipsParsingError("The '{}' instruction is not valid or is not yet supported by this assembler"
                                    .format(self._instruction))
 
-    def _parse_arguments(self, arguments,  instruction_type, argument_format_string, opcode=0, funct=0,
+    def _parse_arguments(self, arguments, instruction_type, argument_format_string, opcode=0, funct=0,
                          rs="$0", rt="$0", rd="$0", sa="0", immediate="0", jump_target="0"):
 
         self._instruction_type = instruction_type
@@ -380,6 +377,8 @@ class _MipsAssembly(object):
             match = re.search("[A-Za-z_][A-Za-z0-9_]*", expression)
             if match is None:
                 break
+            if self._instruction_type == "R":
+                raise MipsParsingError("The shift amount argument does not support labels")
             if match.start() != 0 and ord("0") <= ord(expression[match.start() - 1]) <= ord("9"):
                 raise MipsParsingError("Label '{}' is not allowed to be prefixed with a number".format(match.group()))
             expression = expression.replace(match.group(), "0", 1)
@@ -396,9 +395,51 @@ class _MipsAssembly(object):
         except:
             raise MipsParsingError("Failed to calculate the '{}' expression".format(expression))
 
+    def compile(self, labels):
+        compiled = 0
+        if self._instruction_type == "R":
+            shamt = eval(self._sa)
+            compiled += self._opcode << 26
+            compiled += self._rs << 21
+            compiled += self._rt << 16
+            compiled += self._rd << 11
+            compiled += shamt << 6
+            compiled += self._funct
+
+        elif self._instruction_type == "I":
+            immediate = self._evaluate(self._immediate, labels)
+            compiled += self._opcode << 26
+            compiled += self._rs << 21
+            compiled += self._rt << 16
+            compiled += immediate
+
+        elif self._instruction_type == "J":
+            jump_target = self._evaluate(self._jump_target, labels)
+            compiled += self._opcode << 26
+            compiled += jump_target
+
+        return compiled.to_bytes(4, byteorder='big')
+
+    def _evaluate(self, expression, labels):
+        # Replace labels with 0 for the test
+        while True:
+            match = re.search("[A-Za-z_][A-Za-z0-9_]*", expression)
+            if match is None:
+                break
+            if match.group() not in labels:
+                raise MipsCompileError("The label '{}' is undefined".format(match.group()))
+            expression = expression.replace(match.group(), str(labels[match.group()]), 1)
+
+        # Attempt to calculate the result
+        try:
+            value = int(eval(expression))
+        except:
+            raise MipsCompileError("Failed to calculate the '{}' expression".format(expression))
+        print(value)
+        return value
+
 
 class _MipsLabel(object):
-
     def __init__(self, label):
         self._label = label
         self._validate_label()
@@ -413,7 +454,6 @@ class _MipsLabel(object):
 
 
 class _MipsDirective(object):
-
     def __init__(self, directive):
         self._parse_directive(directive)
 
@@ -463,18 +503,48 @@ class _MipsDirective(object):
     def get_arguments(self):
         return self._arguments
 
+    def get_size(self):
+        return 0
+
 
 class _MipsSection(object):
-
-    def __init__(self):
-        pass
+    def __init__(self, name, address=0):
+        self._name = name
+        self._items = []
+        self._address = address
 
     def add(self, line):
-        pass
+        self._items.append(line)
+
+    def compile(self, labels=None):
+        if labels is None:
+            labels = self.get_labels()
+
+        compiled_section = b""
+        for item in self._items:
+            if type(item) == _MipsAssembly:
+                compiled_section += item.compile(labels)
+
+        return compiled_section
+
+    def get_labels(self, labels=None):
+        if labels is None:
+            labels = {}
+        address = self._address
+        for item in self._items:
+            if type(item) == _MipsAssembly:
+                address += 4
+            elif type(item) == _MipsDirective:
+                address += item.get_size()
+            elif type(item) == _MipsLabel:
+                if item.get_label() in labels:
+                    raise MipsCompileError("The label '{}' was defined more than once".format(item.get_label()))
+                labels[item.get_label()] = address
+
+        return labels
 
 
 class MipsAssembler(object):
-
     def __init__(self, code=None):
         self._default_section = ".text"
         self._default_reorder = True
@@ -520,8 +590,8 @@ class MipsAssembler(object):
 
     def _add_to_section(self, section, item):
         if section not in self._sections.keys():
-            self._sections[section] = []
-        self._sections[section].append(item)
+            self._sections[section] = _MipsSection(section)
+        self._sections[section].add(item)
 
     def add(self, code):
         current_section = self._default_section
@@ -539,16 +609,22 @@ class MipsAssembler(object):
 if __name__ == "__main__":
     assembler = MipsAssembler()
     assembler.add("""
-        lui   $t0, 1
-        ori $t0, 2
+        lui   $t0, label3
+        sll $0, 0
+        ori $t0, label2
         label: label2: .set noreorder
         .section .text.start
-        lw  $t1, 1+ label1 + 0($t9)
+        lw  $t1, 1 +1($t9)
         ori $t0, 2
+        j 1
+        .section .test
+        sll $1, 1
         .section .text
-        label: label2: .set noreorder
+        ori $t0, 2
+        label3:
     """)
-    for section, items in assembler._sections.items():
-        print(section)
-        for item in items:
-            print("\t" + str(item))
+    for section_name, mips_section in assembler._sections.items():
+        print(section_name)
+
+        print(mips_section.compile().hex())
+        print(mips_section.get_labels())
